@@ -96,7 +96,7 @@ def _format_results(checkpoint, results):
 def main():
     args = build_parser().parse_args()
     import torch
-    from lightning.pytorch import seed_everything
+    from pytorch_lightning import seed_everything
     from utils.training import (
         build_trainer,
         create_run_paths,

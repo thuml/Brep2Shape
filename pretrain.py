@@ -99,7 +99,7 @@ def main():
     args = build_parser().parse_args()
     _validate_sampling_args(args)
     import torch
-    from lightning.pytorch import seed_everything
+    from pytorch_lightning import seed_everything
     from utils.training import (
         build_trainer,
         create_run_paths,

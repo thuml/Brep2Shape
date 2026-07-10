@@ -52,6 +52,7 @@ class UVPointPrediction(nn.Module):
             num_layers=args.graph_num_layers,
             num_heads=args.graph_num_heads,
             dropout=args.dropout,
+            attention_dropout=getattr(args, "attention_dropout", args.dropout),
             dim_feedforward=args.dim_feedforward,
             add_positional_encoding=args.add_positional_encoding,
             use_edge_bias=args.use_edge_bias,

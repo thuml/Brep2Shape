@@ -26,6 +26,7 @@ def build_parser():
     parser.add_argument("--dim_feedforward", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.25)
     parser.add_argument("--mlp_dropout", type=float, default=0.1)
+    parser.add_argument("--attention_dropout", type=float, default=0.1)
     parser.add_argument("--act", type=str, default="gelu")
     parser.add_argument("--curve_emb_dim", type=int, default=64)
     parser.add_argument("--surface_emb_dim", type=int, default=64)

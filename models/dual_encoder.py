@@ -44,6 +44,48 @@ def _mean_multiedge_bias(
     aggregated = aggregated / counts.clamp_min(1)
     return aggregated.view(num_nodes, num_nodes, edge_bias.shape[1])
 
+def _bd_attn(q, k, v, edge_bias, src, dst, num_nodes_list, num_edges_list, scale, nhead, attn_dropout=None):
+    """Batched block-diagonal attention == the per-part loop, in one shot.
+    q,k,v: [N_total, H, d]. edge_bias: [E_total, H] or None. Returns [N_total, H, d]."""
+    dev = q.device
+    d = q.shape[-1]
+    P = len(num_nodes_list)
+    nn_t = torch.tensor(num_nodes_list, device=dev)
+    Nmax = int(nn_t.max())
+    N = int(nn_t.sum())
+    node_part = torch.repeat_interleave(torch.arange(P, device=dev), nn_t)
+    node_off = torch.cat([torch.zeros(1, dtype=torch.long, device=dev), nn_t.cumsum(0)[:-1]])
+    node_local = torch.arange(N, device=dev) - node_off[node_part]
+
+    def pad(x):
+        o = x.new_zeros((P, Nmax, nhead, d)); o[node_part, node_local] = x; return o
+    qp, kp, vp = pad(q), pad(k), pad(v)
+
+    key_valid = torch.arange(Nmax, device=dev)[None, :] < nn_t[:, None]
+    add = torch.where(key_valid[:, None, None, :], 0.0, float("-inf"))  # (P,1,1,Nmax)
+
+    if edge_bias is not None:
+        ne_t = torch.tensor(num_edges_list, device=dev)
+        edge_part = torch.repeat_interleave(torch.arange(P, device=dev), ne_t)
+        lsrc = src - node_off[edge_part]
+        ldst = dst - node_off[edge_part]
+        flat = edge_part * (Nmax * Nmax) + lsrc * Nmax + ldst
+        agg = edge_bias.new_zeros((P * Nmax * Nmax, nhead))
+        cnt = edge_bias.new_zeros((P * Nmax * Nmax, 1))
+        agg.index_add_(0, flat, edge_bias)
+        cnt.index_add_(0, flat, edge_bias.new_ones((edge_bias.shape[0], 1)))
+        bias = (agg / cnt.clamp_min(1)).view(P, Nmax, Nmax, nhead)
+        bias = bias + bias.transpose(1, 2)
+        add = add + bias.permute(0, 3, 1, 2)
+
+    scores = torch.einsum("pihd,pjhd->phij", qp, kp) / scale + add
+    w = torch.nn.functional.softmax(scores, dim=-1)
+    if attn_dropout is not None:
+        w = attn_dropout(w)
+    outp = torch.einsum("phij,pjhd->pihd", w, vp)
+    return outp[node_part, node_local]
+
+
 class MLP(nn.Module):
     """Feed-forward network with optional residual hidden layers."""
 
@@ -220,13 +262,30 @@ class FaceTransformerLayer(nn.Module):
         v = self.v_proj(node_feat).view(num_nodes, self.nhead, -1)
         curve_bias = self.curve_proj(edge_feat) if self.use_curve_bias else None
 
+        if __import__("os").environ.get("VERIFY_FACE"):
+            import torch as _t
+            _acc=[]; _ns=0; _es=0
+            for _cn,_ce in zip(g.batch_num_nodes().tolist(), g.batch_num_edges().tolist()):
+                _ne=_ns+_cn; _ee=_es+_ce
+                _sc=_t.einsum("ihd,jhd->hij", q[_ns:_ne], k[_ns:_ne])/self.scale
+                if curve_bias is not None:
+                    _ls=src[_es:_ee]-_ns; _ld=dst[_es:_ee]-_ns
+                    _lb=_mean_multiedge_bias(curve_bias[_es:_ee],_ls,_ld,_cn); _lb=_lb+_lb.transpose(0,1)
+                    _sc=_sc+_lb.permute(2,0,1)
+                _w=_t.softmax(_sc,dim=-1)
+                _acc.append(_t.einsum("hij,jhd->ihd",_w,v[_ns:_ne])); _ns=_ne; _es=_ee
+            _loop=_t.cat(_acc,dim=0)
+            _bat=_bd_attn(q,k,v,curve_bias,src,dst,g.batch_num_nodes().tolist(),g.batch_num_edges().tolist(),self.scale,self.nhead)
+            _d=(_loop-_bat).abs()
+            print("[VERIFY_FACE] p=%s train=%s max=%.3e mean=%.3e"%(self.attn_dropout.p,self.training,_d.max().item(),_d.mean().item()), flush=True)
         attended_components = []
         node_start = 0
         edge_start = 0
-        for component_nodes, component_edges in zip(
+        _BF = bool(__import__("os").environ.get("BATCHED_FACE"))
+        for component_nodes, component_edges in ([] if _BF else zip(
             g.batch_num_nodes().tolist(),
             g.batch_num_edges().tolist(),
-        ):
+        )):
             node_end = node_start + component_nodes
             edge_end = edge_start + component_edges
             component_q = q[node_start:node_end]
@@ -255,7 +314,12 @@ class FaceTransformerLayer(nn.Module):
             node_start = node_end
             edge_start = edge_end
 
-        node_feat = torch.cat(attended_components, dim=0).reshape(num_nodes, -1)
+        if _BF:
+            node_feat = _bd_attn(q, k, v, curve_bias, src, dst,
+                                 g.batch_num_nodes().tolist(), g.batch_num_edges().tolist(),
+                                 self.scale, self.nhead, self.attn_dropout).reshape(num_nodes, -1)
+        else:
+            node_feat = torch.cat(attended_components, dim=0).reshape(num_nodes, -1)
         node_feat = self.out_proj(node_feat)
         node_feat = node_feat_res + node_feat
         node_feat = self.mlp(self.ln_2(node_feat)) + node_feat
@@ -391,10 +455,11 @@ class EdgeTransformerLayer(nn.Module):
         attended_components = []
         edge_start = 0
         line_edge_start = 0
-        for component_edges, component_line_edges in zip(
+        _BE = bool(__import__("os").environ.get("BATCHED_EDGE")) and bool(line_node_counts) and (max(line_node_counts) <= int(__import__("os").environ.get("EDGE_CAP", "2000")))
+        for component_edges, component_line_edges in ([] if _BE else zip(
             line_node_counts,
             L.batch_num_edges().tolist(),
-        ):
+        )):
             edge_end = edge_start + component_edges
             line_edge_end = line_edge_start + component_line_edges
             component_q = q[edge_start:edge_end]
@@ -423,7 +488,12 @@ class EdgeTransformerLayer(nn.Module):
             edge_start = edge_end
             line_edge_start = line_edge_end
 
-        edge_feat = torch.cat(attended_components, dim=0).reshape(num_edges, -1)
+        if _BE:
+            edge_feat = _bd_attn(q, k, v, line_bias, l_src, l_dst,
+                                 line_node_counts, L.batch_num_edges().tolist(),
+                                 self.scale, self.nhead, self.attn_dropout).reshape(num_edges, -1)
+        else:
+            edge_feat = torch.cat(attended_components, dim=0).reshape(num_edges, -1)
         edge_feat = self.out_proj(edge_feat)
 
         edge_feat = edge_feat + edge_feat_res

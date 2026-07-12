@@ -38,12 +38,22 @@ def load_checkpoint_state_dict(
         torch.serialization.add_safe_globals(
             [argparse.Namespace, pathlib.PosixPath, pathlib.WindowsPath]
         )
-
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=True,
-    )
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    else:
+        # torch < 2.4 has no add_safe_globals, so the weights_only unpickler
+        # cannot be extended to allow the argparse.Namespace that Lightning
+        # stores under hyper_parameters. A pretraining checkpoint therefore
+        # fails to load with weights_only=True. Fall back to a full load; the
+        # checkpoint is a local, trusted file produced by pretrain.py.
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
     if not isinstance(checkpoint, Mapping):
         raise TypeError("Checkpoint must contain a mapping")
 
